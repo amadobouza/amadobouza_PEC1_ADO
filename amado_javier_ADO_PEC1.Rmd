@@ -1,0 +1,587 @@
+---
+title: "PEC1"
+author: "Javier Amado Bouza"
+date: "`r format(Sys.time(),'%d de %B, %Y')`"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+link-citations: yes
+bibliography: Bibliografia.bib
+---
+```{r código, include=FALSE, results='hide'}
+#Carga de librerías para realizar las tareas
+library(BiocManager)
+library(arrayQualityMetrics)
+library(affy)
+library(limma)
+library(hgu133plus2.db)
+library(genefilter)
+library(calibrate)
+library(org.Hs.eg.db)
+library(ReactomePA)
+#Carga de los archivos CEL
+rawData <- ReadAffy(celfile.path = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Data/GSE21887_RAW")
+#arrayqualitymetrics de los datos crudos
+arrayQualityMetrics(rawData, 
+                    outdir = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/QCrawData",
+                    intgroup = as.vector(colnames(rawData@phenoData)),
+                    force = T, reporttitle = "Informe_calidad_rawData")
+#RMA
+eset <- affy::rma(rawData)
+#arrayqualitymetrics de los datos normalizados
+arrayQualityMetrics(eset, 
+                    outdir = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/QCeset",
+                    intgroup = as.vector(colnames(eset@phenoData)),
+                    force = T, reporttitle = "Informe_calidad_eset")
+#base de datos correspondiente a nuestro array
+annotation(eset) <- "hgu133plus2.db"
+#Filtrado de genes
+filtrado <- nsFilter(eset, require.entrez = T, remove.dupEntrez = T, var.filter = T, var.func = IQR, var.cutoff = 0.75, filterByQuantile = T, feature.exclude = "^AFFX")
+#Nuestro nuevo expressionset con los datos filtrados
+eset_f <- filtrado$eset
+#Creación de la matriz de diseño
+diseño <- model.matrix(~ 0+factor(c(1,1,1,1,2,2,2,2,3,3,3,3)))
+rownames(diseño) <- as.vector(rownames(eset_f@phenoData))
+colnames(diseño) <- c("AD", "ND", "CR")
+#Ajuste del modelo lineal a cada gen dada una matriz de diseño
+fit <- lmFit(object = eset_f, design = diseño)
+#Creación de la matriz de contraste
+contraste <- limma::makeContrasts(AD-ND,AD-CR, ND-CR, levels= diseño)
+#Computamos los coeficientes estimados y los errores estándar para un grupo de contrastes
+fit2 <- contrasts.fit(fit, contraste)
+#Calculamos estadísticos de Bayes para la expresión diferencial
+fit2 <- eBayes(fit2)
+#Genes más variables por cada comparación
+top_genes1 <- topTable(fit2, number=nrow(fit2), coef = 1 , adjust="BH")
+top_genes2 <- topTable(fit2, number=nrow(fit2), coef = 2 , adjust="BH")
+top_genes3 <- topTable(fit2, number=nrow(fit2), coef = 3 , adjust="BH")
+#Hacemos test múltiples entre genes y contrastes y filtramos los resultados
+resultados<-decideTests(fit2, method="separate", adjust.method="BH", p.value=0.1, lfc=1)
+sumabs<-apply(abs(resultados),1,sum)
+rescero<-resultados[sumabs!=0,] 
+#Diagrama de venn de los resultados 
+vennDiagram(resultados)
+#Función para anotar los probesets
+annotatedTopTable <- function(topTab, anotPackage)
+{
+  topTab <- cbind(PROBEID=rownames(topTab), topTab)
+  myProbes <- rownames(topTab)
+  thePackage <- eval(parse(text = anotPackage))
+  geneAnots <- AnnotationDbi::select(thePackage, myProbes, c("SYMBOL", "ENTREZID", "GENENAME"))
+  annotatedTopTab<- merge(x=geneAnots, y=topTab, by.x="PROBEID", by.y="PROBEID")
+  return(annotatedTopTab)
+}
+#Utilizamos la función para anotar nuestros resultados
+anotado1 <- annotatedTopTable(topTab = top_genes1, anotPackage="hgu133plus2.db")
+anotado2 <- annotatedTopTable(topTab = top_genes2, anotPackage="hgu133plus2.db")
+anotado3 <- annotatedTopTable(topTab = top_genes3, anotPackage="hgu133plus2.db")
+#Preparamos los genes que van a ser analizados
+listOfTables <- list(ADvsND = top_genes1,
+                     ADvsCR  = top_genes2,
+                     NDvsCR = top_genes3)
+listOfSelected <- list()
+for (i in 1:length(listOfTables)){
+  topTab <- listOfTables[[i]]
+  whichGenes<-topTab["adj.P.Val"]<0.15
+  selectedIDs <- rownames(topTab)[whichGenes]
+  EntrezIDs<- AnnotationDbi::select(hgu133plus2.db, selectedIDs, c("ENTREZID"))
+  EntrezIDs <- EntrezIDs$ENTREZID
+  listOfSelected[[i]] <- EntrezIDs
+  names(listOfSelected)[i] <- names(listOfTables)[i]
+}
+sapply(listOfSelected, length)
+#Obtenemos el entrezID de los genes analizados
+mapped_genes2GO <- mappedkeys(org.Hs.egGO)
+mapped_genes2KEGG <- mappedkeys(org.Hs.egPATH)
+mapped_genes <- union(mapped_genes2GO , mapped_genes2KEGG)
+#Con los datos anteriores realizamos el análisis de significación biológica
+listOfData <- listOfSelected[1:3]
+comparisonsNames <- names(listOfData)
+universe <- mapped_genes
+
+for (i in 1:length(listOfData)){
+  genesIn <- listOfData[[i]]
+  comparison <- comparisonsNames[i]
+  enrich.result <- enrichPathway(gene = genesIn,
+                                 pvalueCutoff = 0.05,
+                                 readable = T,
+                                 pAdjustMethod = "BH",
+                                 organism = "human",
+                                 universe = universe)
+  
+  cat("##################################")
+  cat("\nComparison: ", comparison,"\n")
+  print(head(enrich.result))
+
+  if (length(rownames(enrich.result@result)) != 0) {
+  write.csv(as.data.frame(enrich.result), 
+             file=paste0("./results/","ReactomePA.Results.",comparison,".csv"), row.names = FALSE)
+  
+  pdf(file=paste0("./results/","ReactomePABarplot.",comparison,".pdf")) 
+  print(barplot(enrich.result, showCategory = 15, font.size = 4, title = paste0("Reactome Pathway Analysis for ", comparison, ". Barplot")))
+  dev.off()
+  
+  pdf(file = paste0("./results/","ReactomePAcnetplot.",comparison,".pdf"))
+    print(cnetplot(enrich.result, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75))
+  dev.off()
+  }
+}
+#Gráfico de redes enriquecidas
+cnetplot(enrich.result, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75)
+#Código para el volcano plot. El código es el mismo en cada caso, lo que cambia es el dataset.
+attach(anotado1)
+with(anotado1, plot(logFC, -log10(P.Value), pch=20, main="Volcano plot", xlim=c(-5,5), ylim = c(0,10)))
+with(subset(anotado1, adj.P.Val<.05 ), points(logFC, -log10(P.Value), pch=20, col="red"))
+with(subset(anotado1, abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="orange"))
+with(subset(anotado1, adj.P.Val<.05 & abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="green"))
+with(subset(anotado1, adj.P.Val<.01 & abs(logFC)>2), textxy(logFC, -log10(P.Value), labs=SYMBOL, cex=.8))
+detach(anotado1)
+```
+
+El link al repositorio de GitHub es:https://github.com/amadobouza/amadobouza_PEC1_ADO.git
+
+# 1. Abstract
+
+En la búsqueda urgente de nuevas dianas terapéuticas frente al cáncer de próstata resistente a castración, los científicos al cargo del estudio @prostate cuyos resultados están almacenados en GEO como GSE21887 estudiaron tumores obtenidos de ratas mediante la técnica xenograft. Entre otras técnicas analizaron los perfiles de expresión génica en varias condiciones.
+
+# 2. Objetivos
+
+Estudiar las diferencias en la expresión génica entre 3 estadíos diferentes en la evolución del cáncer de próstata.
+
+# 3. Materiales y métodos
+
+## 3.1 Naturaleza de los datos
+
+Los datos se obtuvieron por descarga desde la base de datos GEO, utilizando el número de acceso GSE21887^[https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE21887]. Estos datos se encontraban en forma de 12 archivos CEL(uno por cada array), ya que son derivados de experimentos realizados con arrays de la marca Affymetrix. Concretamente del modelo Affymetrix Human Genome U133 Plus 2.0 Array. 
+
+Se trata de un estudio con 1 solo factor, que es el cáncer de próstata. En este experimento se utilizan tres niveles, que se corresponden con el estadío del tumor cuando se extrae para el análisis. El primero de los niveles es el crecimiento dependiente de andrógeno (AR). El segundo de los niveles es el nadir de la regresión inducido por castración (ND). Y por último el tercero de los niveles es el del recrecimiento resistente a castración (CR). Para cada uno de los 3 niveles se usaron 4 réplicas biológicas lo que nos da un total de 12 unidades experimentales.
+
+## 3.2 Métodos utilizados durante el procedimiento de análisis. 
+
+Para este estudio nos hemos basado en el "pipeline" sugerido en el pdf de esta PEC.
+
+### 3.2.1 Identificar qué grupos hay y a qué grupo pertenece cada muestra
+
+En este caso existen 3 grupos:
+
+* AR - Microarrays con muestras de tumores en niveles de crecimiento dependiente de andrógeno.
+* ND - Microarrays con muestras de tumores en la fase nadir de la regresión inducida por castracion.
+* CR - Microarrays con muestras de tumores en la fase de crecimiento resistente a la castración.
+
+Los códigos de los arrays hibridados en este experimento son los siguientes (Fig. 1):
+
+```{r muestras1, echo=FALSE, fig.align='center', fig.cap="Arrays de este experimento"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_1.png")
+```
+
+Podemos observar que los cuatro primeros arrays pertenecen al grupo AD, los cuatro siguientes pertenecen al grupo ND, y os cuatro últimos pertenecen al grupo CR.
+
+### 3.2.2 Descarga de los archivos CEL y carga de los mismos en RStudio
+
+Una vez identificados los grupos a los que pertenece cada array, pinchamos en el link para descargar el archivo comprimido en el que se encuentran los archivos CEL de cada uno de los 12 arrays utilizados en este estudio.
+
+Se trata de archivos CEL ya que son los resultantes de leer las intensidades de arrays de Affymetrix.
+
+Este procedimiento es fundamental para empezar el análisis de datos de microarrays con R y Bioconductor.
+
+Descomprimimos esos datos, y los cargamos en el entorno de RStudio utilizando la función ReadAffy. El resultado es un objeto de tipo affybatch con todos los datos contenidos en los 12 arrays. 
+
+### 3.2.3 Control de calidad de los datos crudos
+
+Sometemos los datos del affybatch obtenido anteriormente a un control de calidad realizado por la función arrayQualityMetrics.
+
+Este control es importante porque nos proporciona una serie de resultados gráficos en los que podemos ver cómo se distribuyen los datos de los arrays, y nos marca los arrays que cumplen las características para ser considerados defectuosos.
+
+### 3.2.4 Normalización
+
+Para este procedimiento utilizamos el método RMA presente en el paquete affy. 
+
+Se trata del método estándar para los arrays de la marca Affymetrix, como los utilizados en este experimento. 
+
+Este método realiza 3 procedimientos:
+
+* Ajusta el ruído de fondo
+* Realiza una normalización por cuantiles, de los valores del logaritmo en base 2 de cada intensidad ajustada por el ruído de fondo.
+* Estima las intensidades de cada gen, separadamente para cada conjunto de sondas. Para ello utiliza la técnica conocida como median polish.
+
+El resultado final es una matriz en formato expressionSet con los datos normalizados y sumarizados, y en escala logarítmica. 
+
+### 3.2.5 Control de calidad de los datos normalizados
+
+Utilizando de nuevo la función arrayQualityMetrics, en este caso sobre el expressionSet resultante de la aplicación de la función RMA. Hemos realizado un control de calidad para ver si los datos tienen una estructura correcta.
+
+Decidí hacer este paso porque daba un extra de control sobre la forma de los datos obtenidos tras la normalización.
+
+### 3.2.6 Filtrado de los genes menos expresados
+
+Este paso nos limpia nuestro expressionset normalizado, de genes que no superan un umbral de expresión, y que por lo tanto no se espera que estén diferencialmente expresados. 
+
+Para ello utilizamos la función nsFilter del paquete genefilter. 
+
+Además la configuramos para que elimine los datos de los probesets que no tienen datos de identificadores génicos asociados. 
+
+Con ello obtenemos un expressionset filtrado sólo con los genes más variables, y que tienen datos asociados.
+
+### 3.2.7 Identificación de genes diferencialmente expresados
+
+El fin último de este análisis de microarrays es el de identificar genes diferencialmente expresados. 
+
+Para identificar estos genes diferencialmente expresados entre los distintos grupos del estudio utilizamos las funciones disponibles en la librería limma. Éstas utilizan modelos lineales para realizar los contrastes.
+
+Se seleccionó esta librería ya que el número de grupos es mayor de dos, y esta librería facilita el trabajo en este caso. Los pasos a seguir fueron los siguientes:
+
+1. Creamos la matriz de diseño del estudio siguiento los datos de los grupos previamente comentados.
+2. Aplicando ese diseño, especificamos los contrastes que vamos a realizar, y los guardamos en una matriz de contraste.
+3. Finalmente, con los datos normalizados de microarrays, y las matrices de diseño y contraste es posible realizar inferencia sobre los parámetros del modelo, como puede ser la obtención del listado de genes diferencialmente expresados. 
+
+Con cada comparación realizada entre grupos, y con la función toptable obtendremos un dataset con los genes diferencialmente expresados, donde entre otros datos se almacenan los códigos de los pocillos del array, el logaritmo del ratio o razón de expresiones (mide cuántas más veces está expresado un gen en una condición frente a la otra), y el p-valor del valor de logFC obtenido. 
+
+Tras este paso obtenemos un objeto del tipo MArrayLM, que acumula los valores previamente comentados.
+
+### 3.2.8 Anotación de los resultados
+
+De poco sirve obtener un listado de pocillos cuya secuencia contenida sufre un cambio de expresión en la condición B si la comparamos con la A.
+
+Para que estos datos de logFC tengan una interpretación más sencilla debemos anotar qué secuencia concreta está en estos pocillos.
+
+Para esto diseñamos una función que asocia los códigos de los pocillos de nuestro objeto MArrayLM a la información almacenada en las bases de datos genómicas. El nexo de unión es una base de datos específica para nuestro modelo de microarray que nos descargaremos utilizando el instalador del proyecto bioconductor. Enlazándola con nuestra nueva función, esta base de datos asociará el nombre del pocillo con el nombre del gen contenido en ella, su símbolo, o su entrezID (que son las tres informaciones que se extrajeron en nuestro estudio).  
+
+Así, finalmente obtenemos un data.frame por cada comparación hecha. En el que además del número de pocillo se han incorporado tres nuevas columnas, que contienen el nombre del gen asociado al pocillo, su símbolo, y su entrezID.
+
+### 3.2.9 Comparación entre distintas comparaciones
+
+Con el objeto MArrayLM del paso 3.2.7, y utilizando las funciones decideTests y VennDiagram del paquete limma anotamos y contamos los genes que se han seleccionado como diferencialmente expresados en cada comparación.
+
+Así podemos ver de un vistazo cuántos genes están diferencialmente expresados en las comparaciones hechas, y cuántos de ellos son comunes a las tres hechas en este caso. 
+
+La función decideTests nos da una tabla con en la que las filas son el número total de genes que han incrementado su expresión, los que tienen la misma expresión entre los grupos comparados, y los genes que han disminuido su expresión. Y las columnas son cada una de las tres comparaciones realizadas.
+
+La función VennDiagram como su nombre indica nos proporciona un diagrama de Venn donde los genes diferencialmente expresados de cada comparación se encuentran dentro de una elipse, y nos da también cuáles son comunes dos a dos, y los que son comunes a las tres comparaciones. 
+
+### 3.2.10 Análisis de significación biológica
+
+Se ha realizado este paso porque una vez hechas las listas de los genes diferencialmente expresados, y la comparación entre las distintas comparaciones, un paso que facilita mucho la interpretación de los datos es el análisis de la significación biológica. Este análisis nos da información de la función biológica, procesos biológicos, o rutas moleculares en las que se encuentran involucrados los genes diferencialmente expresados en las comparaciones realizadas. 
+
+Para este análisis he utilizado las funciones del paquete ReactomePA. 
+
+Como primer paso obtendremos la lista de genes que serán analizados. En este paso nos interesa tener un número elevado de genes, así que utilizaremos un FDR elevado. En este caso utilizamos un FDR <0,15, y no realizamos ningún filtro de fold-change.
+
+El análisis también requiere que todos los genes a analizar tengan su entrezID.
+
+Los resultados obtenidos en este análisis son los siguientes:
+
+* Un archivo .csv con un resumen de todas las rutas enriquecidas en este estudio, y sus estadísticas asociadas.
+* Un gráfico de barras con las rutas enriquecidas con mejores estadísticas. La altura del gráfico de barras se corresponde con el número de genes de nuestro análisis que están relacionados con esta ruta. Además, las rutas están ordenadas según su significación estadística.
+* Un gráfico que muestra las redes de las rutas enriquecidas, y la relación entre los genes incluidos.
+
+# 4 Resultados
+
+## 4.1 Control de calidad de los datos crudos
+
+El primer resultado que nos ofrece la función arrayQualityMetrics es una tabla resumen con los nombres de los arrays, fecha de su lectura, y los resultados de las distintas pruebas de detección de arrays defectuosos(Fig. 2). 
+
+```{r tabla arrayQualityMetrics no normalizado, echo=FALSE, fig.align='center', fig.cap="Tabla resumen arrayQualityMetrics de datos no normalizados"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_2.png")
+```
+
+Podemos ver que el array número 7 incumple 4 de las 6 métricas. 
+
+Contiuamos con un heatmap de las distancias entre arrays (Fig.3).
+
+```{r heatmap no normalizados, echo=FALSE, fig.align='center', fig.cap="Heatmap de las distancias entre arrays"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_3.png")
+```
+
+El gráfico nos muestra que el array número 7 está bastante distanciado de los otros 11. Por lo que podría tratarse de un array defectuoso.
+
+Obtenemos también un boxplot que muestra la distribución de los datos de cada array (Fig.4).
+
+```{r boxplot no normalizados, echo=FALSE, fig.align='center', fig.cap="Boxplot de los valores de los arrays"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_4.png")
+```
+
+Podemos ver también en este gráfico que el array 7 tiene unos valores que se alejan ligeramente de los del resto. Pero no es suficiente para que con este criterio sea considerado un outlier.
+
+El siguiente gráfico de control de calidad es el de la detección de outliers utilizando la expresión relativa en escala logarítmica (RLE) (Fig. 5).
+
+```{r RLE no normalizados, echo=FALSE, fig.align='center', fig.cap="Detección de outliers mediante RLE"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_5.png")
+```
+
+Este gráfico nos muestra los valores del estadístico de Kolmogorov-Smirnov para los valores de la expresión relativa en escala logarítmica. Se ha calculado un umbral para los datos de este experimento Ra = 0,173 (línea vertical negra), que el array 7 supera. Pudiendo de este modo ser considerado un array defectuoso.
+También podemos observar que los valores de los arrays 8 y 12 son bastante mayores que los del resto de arrays, pero sin llegar a cruzar la línea que los marcaría como posibles arrays defectuosos.
+
+Un gráfico muy informativo en los datos de microarrays son los MA plots (Fig. 6).
+
+```{r MA plot no normalizados, echo=FALSE, fig.align='center', fig.cap="MA plot", out.width="75%"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_6.png")
+```
+
+En este caso se nos muestran dos informaciones. En primer lugar los valores deberían estar distribuidos alrededor del eje M=0. Lo que sugiere que un procedimiento de normalización no le vendría mal a nuestros datos. Continuando con las observaciones, no podemos inferir que exista ningún artefacto causado por el background en los datos de los 8 arrays que se nos muestran. 
+La segunda información de que nos muestra el gráfico es el valor numérico del estadístico Da. Siendo este valor mayor en el array 3 que en el 7. Además ninguno de los arrays superó el umbral de Da>0,15 que es la frontera para marcarlo como posible array defectuoso.
+
+
+## 4.2 Control de calidad de los datos normalizados
+
+El reporte de arrayQualityMetrics comienza de nuevo con la tabla resumen de arrayQualityMetrics (Fig. 7).
+
+```{r tabla arrayQualityMetrics normalizados, echo=FALSE, fig.align='center', fig.cap="Heatmap de las distancias entre arrays"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_7.png")
+```
+
+Nuevamente el array número 7 es el marcado como diferente, en este caso por 2 de las tres métricas. 
+
+Vamos a observar ahora el heatmap de los datos normalizados (Fig. 8).
+
+```{r heatmap normalizados, echo=FALSE, fig.align='center', fig.cap="Heatmap de las distancias entre arrays"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_8.png")
+```
+
+El array 7 claramente es el más diferente al resto.
+
+El siguiente gráfico es el boxplot (Fig. 9).
+
+```{r boxplot normalizados, echo=FALSE, fig.align='center', fig.cap="Boxplot de los arrays normalizados"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_9.png")
+```
+
+En el boxplot hecho con los datos sin normalizar, el array 7 no aparecía marcado como un outlier. Pero tras la normalización, la distribución de los datos de este array no supera esta prueba.
+
+Para finalizar con los gráficos de datos normalizados, vamos a ver el MA plot (Fig. 10).
+
+```{r MA plot normalizados, echo=FALSE, fig.align='center', fig.cap="MA plot de los arrays normalizados", out.width="75%"}
+knitr::include_graphics("/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/Images/Figura_10.png")
+```
+
+El array número 7 muestra tanto la gráfica más dispersa como el valor del estadístico Da más elevado. Pero no es considerado un array defectuoso con este criterio.
+
+## 4.3 Filtrado de los genes menos variables
+
+A continuación mostramos el resultado del filtrado de los genes menos variables.
+
+```{r resultado filtrado, echo=FALSE, fig.cap="Figura 11. Resultado del filtrado de genes menos variables"}
+print(filtrado$filter.log)
+```
+
+Vemos aquí desglosado por categorías el número de genes filtrados.
+
+## 4.4 Identificación de genes diferencialmente expresados
+
+Ahora que ya hemos reducido el número de genes con el fin de ganar potencia, procedemos a identificar los genes cuya expresión ha variado más en cada una de las comparaciones. De cada una de ellas mostramos los 6 cuyo p-valor es más pequeño (Figs. 11, 12 y 13).
+
+```{r top genes 1, echo=FALSE, fig.cap="Genes de la comparación 1 ordenados por su p-valor"}
+head(top_genes1)
+```
+
+```{r top genes2, echo=FALSE, fig.cap="Genes de la comparación 2 ordenados por su p-valor"}
+head(top_genes2)
+```
+
+```{r top genes3, echo=FALSE, fig.cap="Genes de la comparación 3 ordenados por su p-valor"}
+head(top_genes3)
+```
+
+## 4.5 Comparación entre distintas comparaciones
+
+Para tener una visión más global, es interesante ver cuál es el total de genes que han cambiado en cada comparación. Los mostramos a continuación (Fig. 14).
+
+```{r tabla resumen comparaciones, echo=FALSE, fig.cap="Resumen del número de genes con variabilidad en cada comparación"}
+print(summary(resultados))
+```
+
+También es posible mostrarlos como diagrama de Venn para así ver cuáles son comunes a varias comparaciones (Fig. 15).
+
+```{r vennDiagram, echo=FALSE, fig.cap="Diagrama de Venn del número de genes diferencialmente expresados en cada comparación, también se muestran aquellos que coinciden entre una y otra"}
+vennDiagram(resultados)
+```
+
+Una manera muy visual de ver los datos expresión diferencial de microarrays son los volcano plots. Aquí vemos uno por cada comparación realizada. Para que la información sea más visual, se han categorizado según su p-valor y log2FC. Además, los más variables aparecen con su nombre (Figs. 16, 17 y 18).
+
+```{r, echo=FALSE, fig.cap="Volcano plot de la comparación 1"}
+attach(anotado1)
+# Make a basic volcano plot
+with(anotado1, plot(logFC, -log10(P.Value), pch=20, main="Volcano plot", xlim=c(-5,5), ylim = c(0,10)))
+
+# Add colored points: red if padj<0.05, orange of log2FC>1, green if both)
+with(subset(anotado1, adj.P.Val<.05 ), points(logFC, -log10(P.Value), pch=20, col="red"))
+with(subset(anotado1, abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="orange"))
+with(subset(anotado1, adj.P.Val<.05 & abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="green"))
+
+# Label points with the textxy function from the calibrate plot
+with(subset(anotado1, adj.P.Val<.01 & abs(logFC)>2), textxy(logFC, -log10(P.Value), labs=SYMBOL, cex=.8))
+detach(anotado1)
+```
+
+```{r, echo=FALSE, fig.cap="Volcano plot de la comparación 2"}
+attach(anotado2)
+# Make a basic volcano plot
+with(anotado2, plot(logFC, -log10(P.Value), pch=20, main="Volcano plot", xlim=c(-5,5), ylim = c(0,10)))
+
+# Add colored points: red if padj<0.05, orange of log2FC>1, green if both)
+with(subset(anotado2, adj.P.Val<.05 ), points(logFC, -log10(P.Value), pch=20, col="red"))
+with(subset(anotado2, abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="orange"))
+with(subset(anotado2, adj.P.Val<.05 & abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="green"))
+
+# Label points with the textxy function from the calibrate plot
+with(subset(anotado2, adj.P.Val<.01 & abs(logFC)>2), textxy(logFC, -log10(P.Value), labs=SYMBOL, cex=.8))
+detach(anotado2)
+```
+
+```{r, echo=FALSE, fig.cap="Volcano plot de la comparación 3"}
+attach(anotado3)
+# Make a basic volcano plot
+with(anotado3, plot(logFC, -log10(P.Value), pch=20, main="Volcano plot", xlim=c(-5,5), ylim = c(0,10)))
+
+# Add colored points: red if padj<0.05, orange of log2FC>1, green if both)
+with(subset(anotado3, adj.P.Val<.05 ), points(logFC, -log10(P.Value), pch=20, col="red"))
+with(subset(anotado3, abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="orange"))
+with(subset(anotado3, adj.P.Val<.05 & abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="green"))
+
+# Label points with the textxy function from the calibrate plot
+with(subset(anotado3, adj.P.Val<.01 & abs(logFC)>2), textxy(logFC, -log10(P.Value), labs=SYMBOL, cex=.8))
+detach(anotado3)
+```
+
+## 4.6 Análisis de la significación biológica
+
+Para finalizar, realizaremos un gráfico que muestra las redes bioquímicas enriquecidas según los resultados de este estudio (Fig. 19).
+
+```{r, echo=FALSE, fig.cap="Figura 16. Redes de rutas enriquecidas en este estudio"}
+cnetplot(enrich.result, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75)
+```
+
+
+# 5 Discusión
+
+El número de muestras de nuestro estudio es correcto según **web**, ya que es el número mínimo para obtener un poder de 0.8 con un nivel de significación de 0,05 y una diferencia de medias de 2. 
+
+Con respecto al array número 7, que algunos indicadores para detectar muestras erróneas daban como outlier, se decidió no sacarlo porque por una parte el número de muestras sería inferior al mínimo calculado para tener poder estadístico. Y por otra parte, en este estudio se buscaba diferencias en la expresión, y al eliminarlo estaríamos perdiendo fuentes de variabilidad. Precisamente para facilitar la variabilidad en las muestras, a costa de inroducir algunos resultados erróneos tampoco se realizó filtraje no específico. 
+
+Debido a todo lo indicado previamente, en siguientes fases se podría hacer RT-qPCR para afinar los resultados de nuestro estudio.  
+
+# 6 Apéndice con el código de R utilizado en el estudio
+
+```{r código completo,results="hide"}
+#Carga de los archivos CEL
+rawData <- ReadAffy(celfile.path = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Data/GSE21887_RAW")
+#arrayqualitymetrics de los datos crudos
+arrayQualityMetrics(rawData, 
+                    outdir = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/QCrawData",
+                    intgroup = as.vector(colnames(rawData@phenoData)),
+                    force = T, reporttitle = "Informe_calidad_rawData")
+#RMA
+eset <- affy::rma(rawData)
+#arrayqualitymetrics de los datos normalizados
+arrayQualityMetrics(eset, 
+                    outdir = "/Volumes/Coisas/Javier/Master/2020/2/Análisis_datos_omicos/PEC1/Results/QCeset",
+                    intgroup = as.vector(colnames(eset@phenoData)),
+                    force = T, reporttitle = "Informe_calidad_eset")
+#base de datos correspondiente a nuestro array
+annotation(eset) <- "hgu133plus2.db"
+#Filtrado de genes
+filtrado <- nsFilter(eset, require.entrez = T, remove.dupEntrez = T, var.filter = T, var.func = IQR, var.cutoff = 0.75, filterByQuantile = T, feature.exclude = "^AFFX")
+#Nuestro nuevo expressionset con los datos filtrados
+eset_f <- filtrado$eset
+#Creación de la matriz de diseño
+diseño <- model.matrix(~ 0+factor(c(1,1,1,1,2,2,2,2,3,3,3,3)))
+rownames(diseño) <- as.vector(rownames(eset_f@phenoData))
+colnames(diseño) <- c("AD", "ND", "CR")
+#Ajuste del modelo lineal a cada gen dada una matriz de diseño
+fit <- lmFit(object = eset_f, design = diseño)
+#Creación de la matriz de contraste
+contraste <- limma::makeContrasts(AD-ND,AD-CR, ND-CR, levels= diseño)
+#Computamos los coeficientes estimados y los errores estándar para un grupo de contrastes
+fit2 <- contrasts.fit(fit, contraste)
+#Calculamos estadísticos de Bayes para la expresión diferencial
+fit2 <- eBayes(fit2)
+#Genes más variables por cada comparación
+top_genes1 <- topTable(fit2, number=nrow(fit2), coef = 1 , adjust="BH")
+top_genes2 <- topTable(fit2, number=nrow(fit2), coef = 2 , adjust="BH")
+top_genes3 <- topTable(fit2, number=nrow(fit2), coef = 3 , adjust="BH")
+#Hacemos test múltiples entre genes y contrastes y filtramos los resultados
+resultados<-decideTests(fit2, method="separate", adjust.method="BH", p.value=0.1, lfc=1)
+sumabs<-apply(abs(resultados),1,sum)
+rescero<-resultados[sumabs!=0,] 
+#Diagrama de venn de los resultados 
+vennDiagram(resultados)
+#Función para anotar los probesets
+annotatedTopTable <- function(topTab, anotPackage)
+{
+  topTab <- cbind(PROBEID=rownames(topTab), topTab)
+  myProbes <- rownames(topTab)
+  thePackage <- eval(parse(text = anotPackage))
+  geneAnots <- AnnotationDbi::select(thePackage, myProbes, c("SYMBOL", "ENTREZID", "GENENAME"))
+  annotatedTopTab<- merge(x=geneAnots, y=topTab, by.x="PROBEID", by.y="PROBEID")
+  return(annotatedTopTab)
+}
+#Utilizamos la función para anotar nuestros resultados
+anotado1 <- annotatedTopTable(topTab = top_genes1, anotPackage="hgu133plus2.db")
+anotado2 <- annotatedTopTable(topTab = top_genes2, anotPackage="hgu133plus2.db")
+anotado3 <- annotatedTopTable(topTab = top_genes3, anotPackage="hgu133plus2.db")
+#Preparamos los genes que van a ser analizados
+listOfTables <- list(ADvsND = top_genes1,
+                     ADvsCR  = top_genes2,
+                     NDvsCR = top_genes3)
+listOfSelected <- list()
+for (i in 1:length(listOfTables)){
+  topTab <- listOfTables[[i]]
+  whichGenes<-topTab["adj.P.Val"]<0.15
+  selectedIDs <- rownames(topTab)[whichGenes]
+  EntrezIDs<- AnnotationDbi::select(hgu133plus2.db, selectedIDs, c("ENTREZID"))
+  EntrezIDs <- EntrezIDs$ENTREZID
+  listOfSelected[[i]] <- EntrezIDs
+  names(listOfSelected)[i] <- names(listOfTables)[i]
+}
+sapply(listOfSelected, length)
+#Obtenemos el entrezID de los genes analizados
+mapped_genes2GO <- mappedkeys(org.Hs.egGO)
+mapped_genes2KEGG <- mappedkeys(org.Hs.egPATH)
+mapped_genes <- union(mapped_genes2GO , mapped_genes2KEGG)
+#Con los datos anteriores realizamos el análisis de significación biológica
+listOfData <- listOfSelected[1:3]
+comparisonsNames <- names(listOfData)
+universe <- mapped_genes
+
+for (i in 1:length(listOfData)){
+  genesIn <- listOfData[[i]]
+  comparison <- comparisonsNames[i]
+  enrich.result <- enrichPathway(gene = genesIn,
+                                 pvalueCutoff = 0.05,
+                                 readable = T,
+                                 pAdjustMethod = "BH",
+                                 organism = "human",
+                                 universe = universe)
+  
+  cat("##################################")
+  cat("\nComparison: ", comparison,"\n")
+  print(head(enrich.result))
+
+  if (length(rownames(enrich.result@result)) != 0) {
+  write.csv(as.data.frame(enrich.result), 
+             file=paste0("./results/","ReactomePA.Results.",comparison,".csv"), row.names = FALSE)
+  
+  pdf(file=paste0("./results/","ReactomePABarplot.",comparison,".pdf")) 
+  print(barplot(enrich.result, showCategory = 15, font.size = 4, title = paste0("Reactome Pathway Analysis for ", comparison, ". Barplot")))
+  dev.off()
+  
+  pdf(file = paste0("./results/","ReactomePAcnetplot.",comparison,".pdf"))
+    print(cnetplot(enrich.result, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75))
+  dev.off()
+  }
+}
+#Gráfico de redes enriquecidas
+cnetplot(enrich.result, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75)
+#Código para el volcano plot. El código es el mismo en cada caso, lo que cambia es el dataset.
+attach(anotado1)
+with(anotado1, plot(logFC, -log10(P.Value), pch=20, main="Volcano plot", xlim=c(-5,5), ylim = c(0,10)))
+with(subset(anotado1, adj.P.Val<.05 ), points(logFC, -log10(P.Value), pch=20, col="red"))
+with(subset(anotado1, abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="orange"))
+with(subset(anotado1, adj.P.Val<.05 & abs(logFC)>1), points(logFC, -log10(P.Value), pch=20, col="green"))
+with(subset(anotado1, adj.P.Val<.01 & abs(logFC)>2), textxy(logFC, -log10(P.Value), labs=SYMBOL, cex=.8))
+detach(anotado1)
+```
+# Bibliografía
